@@ -4,7 +4,7 @@
  * 相对原版（纯透传）的改动：
  *  1. 服务端持有 Groq key 池（Secret GROQ_KEYS，逗号分隔），客户端不再传 gsk_ key
  *  2. 对外只认一个代理令牌（Secret PROXY_TOKEN）
- *  3. 轮询起手 + 429/401/403 自动换下一个 key 重试
+ *  3. 随机起点轮询 + 仅 429/401 换下一个 key 重试（403 是按来源国判定的，换 key 无意义）
  *  4. 路径原样保留：/openai/v1/... → https://api.groq.com/openai/v1/...
  *     因此 base_url 仍是 https://<域名>/openai/v1（与 Deno 版一致，客户端无需改路径）
  *
@@ -28,6 +28,38 @@ const RETRY_STATUS = new Set([429, 401]);
 
 // 超过这个体积的请求体不读进内存（省内存，放弃换 key 重试）
 const BUFFER_LIMIT = 8 * 1024 * 1024;
+
+/**
+ * 读请求体，最多 limit 字节。超过则返回 null（此时流已被读掉一部分，调用方必须放弃重试）。
+ * 没有 content-length 的请求也走这里，所以读入量始终有硬上限。
+ */
+async function readUpTo(request, limit) {
+  if (!request.body) return new Uint8Array(0);
+  const reader = request.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > limit) {
+        try { await reader.cancel(); } catch (_) {}
+        return null;
+      }
+      chunks.push(value);
+    }
+  } catch (_) {
+    return null;
+  }
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.byteLength;
+  }
+  return out;
+}
 
 // isolate 级冷却表：刚被限流/失效的 key 排到最后，避免每个请求都先撞一遍
 const cooldown = new Map();
@@ -134,13 +166,30 @@ export default {
       }));
     }
 
-    // 请求体只读一次，用于多 key 重试。
-    // 大请求体（语音转写最多 25MB）不缓冲：读进内存既占 isolate 内存，
-    // 又要在重试时整份重发；这类请求直接用当前选中的 key 流式转发。
+    // 请求体只读一次，用于多 key 重试。大请求体不缓冲：读进内存既占 isolate
+    // 内存，又要在重试时整份重发；这类请求用当前 key 流式转发且不重试。
+    //
+    // 关键词：**超限**才算大。没有 content-length 的请求（chunked / ReadableStream
+    // 客户端）本身不说明大小，一律按大处理会让所有不带长度头的请求都失去重试能力，
+    // 所以默认仍然缓冲；但要给缓冲设硬闸——边读边数，超过 BUFFER_LIMIT 立即放弃，
+    // 退回原始流。这样既不会把 8MB 以上的体读进内存，也不会误伤小请求的重试。
     const hasBody = !(request.method === "GET" || request.method === "HEAD");
-    const len = Number(request.headers.get("content-length") || 0);
-    const bigBody = len > BUFFER_LIMIT;
-    const body = hasBody && !bigBody ? await request.arrayBuffer() : request.body;
+    const clRaw = request.headers.get("content-length");
+    const declared = clRaw === null ? null : Number(clRaw);
+    let bigBody = declared !== null && !(declared <= BUFFER_LIMIT);
+    let body;
+    if (hasBody && !bigBody) {
+      const buf = await readUpTo(request, BUFFER_LIMIT);
+      if (buf) {
+        body = buf;
+      } else {
+        // 超限：原请求体已被消费，只能按「无体」转发并拒绝重试
+        bigBody = true;
+        body = null;
+      }
+    } else {
+      body = hasBody ? request.body : null;
+    }
 
     const target = new URL(request.url);
     target.hostname = GROQ_HOST;
@@ -157,6 +206,7 @@ export default {
     baseHeaders.delete("cf-visitor");
     baseHeaders.delete("x-forwarded-proto");
     baseHeaders.delete("x-real-ip");
+    baseHeaders.delete("cookie");
 
     // 随机起点 + 冷却表：多 isolate 间模块级游标不共享，固定起点会让各 isolate
     // 都偏向 keys[0]（实测 6 连发 4/2/0）；随机起点长期分布均匀（96 样本 30/28/31）。
@@ -184,7 +234,8 @@ export default {
           status: 502,
           headers: { "content-type": "application/json" },
         });
-        // 大请求体是流，已经消费掉，换 key 重发没有意义
+        // 流式请求体（>8MB 或没有 content-length）已被上游消费掉，
+        // 换 key 重发只会发一个空 body；直接返回错误，不要空转 N 次白记冷却。
         if (bigBody) break;
         continue;
       }
@@ -197,6 +248,11 @@ export default {
           try { await resp.body?.cancel(); } catch (_) {}
           lastResp = resp;
           continue;
+        }
+        // 流式请求体不能重发：保留这一发的结果，结束循环
+        if (bigBody) {
+          lastResp = resp;
+          break;
         }
       }
 

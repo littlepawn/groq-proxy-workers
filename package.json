@@ -1,9 +1,10 @@
 {
-  "name": "groq-proxy",
+  "name": "groq-proxy-pool",
   "version": "1.0.0",
   "private": true,
-  "type": "module",
   "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "check:inline": "node tools/check-inline.cjs",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "tail": "wrangler tail"
@@ -11,5 +12,5 @@
   "devDependencies": {
     "wrangler": "^4.157.0"
   },
-  "license": "MIT"
+  "type": "module"
 }

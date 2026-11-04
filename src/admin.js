@@ -408,7 +408,7 @@ async function testAll(){
     if(!r.ok)throw new Error("HTTP "+r.status);
     const d=await r.json();
     const box=$("keys");box.innerHTML="";
-    let ok=0,remSum=0,msSum=0,msN=0;
+    let ok=0,remSum=0,msSum=0,msN=0,remKnown=0;
     for(const x of d.results){
       const rem=parseInt(x.limits["x-ratelimit-remaining-requests"]??"NaN");
       const lim=parseInt(x.limits["x-ratelimit-limit-requests"]??"NaN");
@@ -417,7 +417,7 @@ async function testAll(){
       let pct=lim>0&&rem>=0?Math.round(rem/lim*100):null;
       const cls=pct==null?"":(pct>50?"":(pct>20?"mid":"low"));
       if(x.status===200)ok++;
-      if(rem>=0)remSum+=rem;
+      if(rem>=0){remSum+=rem;remKnown++;}
       if(x.ms!=null){msSum+=x.ms;msN++;}
       const card=document.createElement("div");card.className="kcard";
       const delBtn=(x.source==="kv"&&x.id)
@@ -438,7 +438,9 @@ async function testAll(){
     }
     $("st-pool").textContent=d.results.length;
     $("st-ok").textContent=d.results.length?ok+"/"+d.results.length:"0";
-    $("st-req").textContent=remSum||"—";
+    // 剩余额度合计：没有任何一把返回额度头时显示"未知"，
+    // 明确探到 0 也要如实显示 0，不能被「或空串取默认」的写法吞掉（那会掩盖额度耗尽）
+    $("st-req").textContent=remKnown?remSum:"未知";
     $("st-ms").textContent=msN?(msSum/msN).toFixed(0)+" ms":"—";
     if(d.results.length&&!ok)toast("全部 403：当前来源被 Groq 拒绝");
   }catch(e){toast("探活失败: "+e.message);$("st-ok").textContent="—";}
@@ -598,10 +600,16 @@ export async function handleAdmin(request, env) {
     });
   }
 
-  // 探活结果附带来源与 id（供前端渲染删除按钮）
+  // 探活结果附带来源与 id（供前端渲染删除按钮）。
+  // 必须按**索引**关联，不能按 mask(key) 反查：mask 只露尾 4 位，
+  // 池里出现尾号相同的两把 key 时，按 mask 建 Map 会让后者覆盖前者，
+  // 于是前者的卡片挂上后者的 id —— 点删除会删错 key。
   if (url.pathname === "/admin/api/test" && request.method === "POST") {
-    const meta = new Map(detail.map((d) => [mask(d.key), { id: d.id, source: d.source }]));
-    const results = (await probe(keys)).map((r) => ({ ...r, ...(meta.get(r.key) || {}) }));
+    const results = (await probe(keys)).map((r, i) => ({
+      ...r,
+      id: detail[i]?.id ?? null,
+      source: detail[i]?.source ?? null,
+    }));
     return json({ results, colo: request.cf?.colo || null });
   }
 

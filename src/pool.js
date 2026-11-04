@@ -24,7 +24,8 @@ let cache = { at: 0, list: [] };
  * 但跨 colo 的读最长要 60 秒才看到。为了让「刚加完就生效」在管理台上成立，
  * 这里维护一份本 isolate 的写入覆盖层，KV 追上来后自动丢弃。
  */
-const pending = { adds: new Map(), dels: new Set() };
+// dels: id → 被删 key 的值（删后重加要靠它判定「KV 里那条到底是不是同一条」）
+const pending = { adds: new Map(), dels: new Map() };
 
 function overlay(rows) {
   const out = rows.filter((r) => !pending.dels.has(r.id));
@@ -34,22 +35,31 @@ function overlay(rows) {
   return out;
 }
 
-/** KV 已经反映了某条写入时，把它从覆盖层摘掉 */
+/**
+ * KV 已经反映了某条写入时，把它从覆盖层摘掉。
+ *
+ * 对删除标记：只要 KV 里该 id 不存在就说明删除已生效，可以摘掉标记。
+ * 「删除后又被加回、新写入还没传播」这种情况由 addKeys 在 put 成功后
+ * 主动 pending.dels.delete(id) 处理，不指望这里区分 —— 那样会把删除标记永久留下。
+ */
 function settle(kvRows) {
   const ids = new Set(kvRows.map((r) => r.id));
   for (const id of [...pending.adds.keys()]) if (ids.has(id)) pending.adds.delete(id);
-  for (const id of [...pending.dels]) if (!ids.has(id)) pending.dels.delete(id);
+  for (const id of [...pending.dels.keys()]) if (!ids.has(id)) pending.dels.delete(id);
 }
 
-/** 直读 KV（不走缓存、不叠覆盖层），写入路径用它当基底 */
+/**
+ * 直读 KV（不走缓存、不叠覆盖层），写入路径用它当基底。
+ *
+ * 读失败必须抛错，不能吞成 []：addKeys / removeKey 都以它的返回值当写基底，
+ * 一旦把「读失败」当成「池是空的」写回去，一次瞬态 KV 故障就会把整个动态号池
+ * 覆盖成「只剩本次新增」，而且接口还会返回 ok，用户毫无察觉。
+ * 读路径（dynamicKeys）自己捕获异常并退回上一份缓存，不在这里兜。
+ */
 async function readRaw(env) {
   if (!env.KEYS_KV) return [];
-  try {
-    const raw = await env.KEYS_KV.get(KV_POOL, "json");
-    return Array.isArray(raw) ? await toRecords(raw) : [];
-  } catch (_) {
-    return [];
-  }
+  const raw = await env.KEYS_KV.get(KV_POOL, "json");
+  return Array.isArray(raw) ? await toRecords(raw) : [];
 }
 
 function norm(list) {
@@ -62,7 +72,10 @@ function norm(list) {
     if (!v.startsWith("gsk_") || v.length < 20) continue;
     if (seen.has(v)) continue;
     seen.add(v);
-    out.push(item);
+    // 去重用的是 trim 后的值，写出去也必须是 trim 后的值：
+    // 否则手工用 wrangler kv key put 写入带尾随空白的 key，
+    // 会拼成 `Bearer gsk_xxx `（带空格）→ 上游 401 → 被当成失效 key 摘掉。
+    out.push(typeof item === "string" ? v : { ...item, k: v });
   }
   return out;
 }
@@ -92,12 +105,14 @@ export async function dynamicKeys(env, { fresh = false } = {}) {
   if (!env.KEYS_KV) return [];
   const now = Date.now();
   if (!fresh && now - cache.at < KV_TTL_MS) return overlay(cache.list);
-  let list = [];
+  let list;
   try {
     const raw = await env.KEYS_KV.get(KV_POOL, "json");
     list = Array.isArray(raw) ? await toRecords(raw) : [];
   } catch (_) {
-    list = [];
+    // 读失败：退回上一份缓存，且不刷新 cache.at，让下次请求继续重试；
+    // 把 [] 写进缓存会让动态 key 整整 30 秒从号池里消失。
+    return overlay(cache.list);
   }
   settle(list);
   cache = { at: now, list };
@@ -180,6 +195,7 @@ export async function addKeys(env, text) {
   const added = [];
   const duplicate = [];
   const invalid = [];
+  const fresh = [];
 
   for (const k of incoming) {
     if (!k.startsWith("gsk_") || k.length < 20) {
@@ -193,14 +209,20 @@ export async function addKeys(env, text) {
     existing.add(k);
     const rec = { id: await keyId(k), k, added: new Date().toISOString() };
     merged.push(rec);
-    if (pending.adds.size >= PENDING_MAX) pending.adds.delete(pending.adds.keys().next().value);
-    pending.adds.set(rec.id, rec);
+    fresh.push(rec);
     added.push({ id: rec.id, key: mask(k) });
   }
 
   if (added.length) {
     const next = norm(merged);
+    // 先落 KV 再更新覆盖层：put 抛错时不能留下「只有本 isolate 认为加了」的状态，
+    // 否则后续 add/delete 都会拿这条幻影记录当基底继续写。
     await env.KEYS_KV.put(KV_POOL, JSON.stringify(next));
+    for (const rec of fresh) {
+      pending.dels.delete(rec.id); // 删后重加：以本次新增为准
+      if (pending.adds.size >= PENDING_MAX) pending.adds.delete(pending.adds.keys().next().value);
+      pending.adds.set(rec.id, rec);
+    }
     cache = { at: Date.now(), list: next };
   }
   return { added, duplicate, invalid };
@@ -214,12 +236,15 @@ export async function removeKey(env, id) {
   const merged = [...base];
   for (const [pid, rec] of pending.adds) if (!seenId.has(pid)) merged.push(rec);
 
+  const target = merged.find((x) => x.id === id);
   const next = merged.filter((x) => x.id !== id);
-  if (next.length === merged.length) return { removed: false };
+  if (!target) return { removed: false };
   await env.KEYS_KV.put(KV_POOL, JSON.stringify(next));
   pending.adds.delete(id);
-  if (pending.dels.size >= PENDING_MAX) pending.dels.delete(pending.dels.values().next().value);
-  pending.dels.add(id);
+  // 记删除标记时保留 key 值（排查时有据可查）。同 isolate 上「删完立刻加回」的
+  // 场景由 addKeys 在 put 成功后 pending.dels.delete(id) 收尾，不依赖这里的值。
+  if (pending.dels.size >= PENDING_MAX) pending.dels.delete(pending.dels.keys().next().value);
+  pending.dels.set(id, target.k);
   cache = { at: Date.now(), list: norm(next) };
   return { removed: true };
 }
