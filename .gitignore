@@ -1,0 +1,4 @@
+.proxy_token
+.dev.vars
+.wrangler/
+node_modules/

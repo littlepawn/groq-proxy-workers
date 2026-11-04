@@ -1,0 +1,21 @@
+{
+  // Cloudflare Workers 配置
+  // 部署前：cp wrangler.example.jsonc wrangler.jsonc 然后按下面注释填自己的值
+  "name": "groq-proxy",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-11-01",
+  "observability": { "enabled": true },
+  "placement": { "region": "gcp:us-central1" },
+  // KV（管理台自助增删 key 用，必需）：先执行
+  //   npx wrangler kv namespace create KEYS_KV
+  // 把输出的 id 填到下面，再取消注释本段。
+  // "kv_namespaces": [
+  //   { "binding": "KEYS_KV", "id": "<your-kv-namespace-id>" }
+  // ],
+  // 自定义域名（可选）：把 example.com 换成你自己的域名后取消注释。
+  // custom_domain 为 true 时 wrangler 会自动创建 DNS 记录与证书；
+  // 不绑域名则删掉本段，直接用 <worker-name>.<subdomain>.workers.dev。
+  // "routes": [
+  //   { "pattern": "groq-proxy.example.com", "custom_domain": true }
+  // ]
+}
