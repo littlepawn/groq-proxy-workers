@@ -26,6 +26,9 @@ const GROQ_HOST = "api.groq.com";
 // 换多少把 key 都一样，全池重试只会把上游请求放大 N 倍。
 const RETRY_STATUS = new Set([429, 401]);
 
+// 超过这个体积的请求体不读进内存（省内存，放弃换 key 重试）
+const BUFFER_LIMIT = 8 * 1024 * 1024;
+
 // isolate 级冷却表：刚被限流/失效的 key 排到最后，避免每个请求都先撞一遍
 const cooldown = new Map();
 const COOLDOWN_401 = 5 * 60_000;
@@ -114,9 +117,13 @@ export default {
       }));
     }
 
-    // 请求体只读一次，用于多 key 重试
+    // 请求体只读一次，用于多 key 重试。
+    // 大请求体（语音转写最多 25MB）不缓冲：读进内存既占 isolate 内存，
+    // 又要在重试时整份重发；这类请求直接用当前选中的 key 流式转发。
     const hasBody = !(request.method === "GET" || request.method === "HEAD");
-    const body = hasBody ? await request.arrayBuffer() : undefined;
+    const len = Number(request.headers.get("content-length") || 0);
+    const bigBody = len > BUFFER_LIMIT;
+    const body = hasBody && !bigBody ? await request.arrayBuffer() : request.body;
 
     const target = new URL(request.url);
     target.hostname = GROQ_HOST;
@@ -158,7 +165,7 @@ export default {
         continue;
       }
 
-      if (RETRY_STATUS.has(resp.status) && i < seq.length - 1) {
+      if (!bigBody && RETRY_STATUS.has(resp.status) && i < seq.length - 1) {
         // 该 key 被限流或失效，换下一个。响应体丢弃前先取消，避免占用额度
         coolKey(key, resp.status, resp.headers.get("retry-after"));
         try { await resp.body?.cancel(); } catch (_) {}
@@ -166,6 +173,7 @@ export default {
         continue;
       }
 
+      if (resp.status === 200 && cooldown.has(key)) cooldown.delete(key);
       const out = new Headers(resp.headers);
       out.set("x-groq-proxy-key", mask(key));
       out.set("x-groq-proxy-pool", `${keys.length}`);

@@ -13,7 +13,7 @@
  *   POST /admin/api/chat     最小对话测试（body: {model, prompt}）
  *
  * 鉴权：
- *   - 浏览器：登录后发 HttpOnly cookie（值为 SHA-256(PROXY_TOKEN + 盐)），7 天有效
+ *   - 浏览器：登录后发 HttpOnly cookie（值为 SHA-256(固定前缀 + PROXY_TOKEN)），7 天有效
  *   - curl/API：仍支持 Basic（用户名任意，密码 = PROXY_TOKEN）
  *
  * 说明：
@@ -76,46 +76,68 @@ async function isAuthed(request, env) {
 
 /* ---------------- Groq 探测 ---------------- */
 
-/** 逐个 key 打一次最小 chat 请求，拿状态码 + 限流头（/models 不返回 x-ratelimit-*） */
+/**
+ * 逐个 key 打一次最小 chat 请求，拿状态码 + 限流头（/models 不返回 x-ratelimit-*）。
+ * 并发上限 PROBE_CONCURRENCY：号池变大后全池同时打会把子请求数一次顶到
+ * Workers 单请求 50 的上限，且瞬时挤占同一账号的 RPM。
+ */
+const PROBE_CONCURRENCY = 6;
+
+/** 随机起点遍历池：管理台的 models/chat 测试不该每次都固定撞第一把 key */
+function rotate(keys) {
+  if (!keys.length) return keys;
+  const start = Math.floor(Math.random() * keys.length);
+  return keys.slice(start).concat(keys.slice(0, start));
+}
+
 async function probe(keys) {
-  return Promise.all(
-    keys.map(async (k, i) => {
-      const t0 = Date.now();
-      const rec = { index: i, key: mask(k), status: null, ms: null, error: null, limits: {} };
+  const out = new Array(keys.length);
+  let next = 0;
+  async function worker() {
+    while (next < keys.length) {
+      const i = next++;
+      out[i] = await probeOne(keys[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(PROBE_CONCURRENCY, keys.length) }, worker));
+  return out;
+}
+
+async function probeOne(k, i) {
+  const t0 = Date.now();
+  const rec = { index: i, key: mask(k), status: null, ms: null, error: null, limits: {} };
+  try {
+    const r = await fetch(`${GROQ}/openai/v1/chat/completions`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${k}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        model: "openai/gpt-oss-20b",
+        messages: [{ role: "user", content: "hi" }],
+        max_tokens: 1,
+        stream: false,
+      }),
+    });
+    rec.status = r.status;
+    rec.ms = Date.now() - t0;
+    for (const [h, v] of r.headers) {
+      const hl = h.toLowerCase();
+      if (hl.startsWith("x-ratelimit-") || hl === "retry-after") rec.limits[hl] = v;
+    }
+    if (r.status !== 200) {
+      const body = await r.text();
       try {
-        const r = await fetch(`${GROQ}/openai/v1/chat/completions`, {
-          method: "POST",
-          headers: { authorization: `Bearer ${k}`, "content-type": "application/json" },
-          body: JSON.stringify({
-            model: "openai/gpt-oss-20b",
-            messages: [{ role: "user", content: "hi" }],
-            max_tokens: 1,
-            stream: false,
-          }),
-        });
-        rec.status = r.status;
-        rec.ms = Date.now() - t0;
-        for (const [h, v] of r.headers) {
-          const hl = h.toLowerCase();
-          if (hl.startsWith("x-ratelimit-") || hl === "retry-after") rec.limits[hl] = v;
-        }
-        if (r.status !== 200) {
-          const body = await r.text();
-          try {
-            rec.error = JSON.parse(body)?.error?.message || body.slice(0, 160);
-          } catch (_) {
-            rec.error = body.slice(0, 160);
-          }
-        } else {
-          await r.body?.cancel();
-        }
-      } catch (e) {
-        rec.ms = Date.now() - t0;
-        rec.error = e.message;
+        rec.error = JSON.parse(body)?.error?.message || body.slice(0, 160);
+      } catch (_) {
+        rec.error = body.slice(0, 160);
       }
-      return rec;
-    }),
-  );
+    } else {
+      await r.body?.cancel();
+    }
+  } catch (e) {
+    rec.ms = Date.now() - t0;
+    rec.error = e.message;
+  }
+  return rec;
 }
 
 function modalityTags(m) {
@@ -134,8 +156,9 @@ function modalityTags(m) {
 async function fetchModels(key) {
   const r = await fetch(`${GROQ}/openai/v1/models`, {
     headers: { authorization: `Bearer ${key}` },
+    signal: AbortSignal.timeout(20_000),
   });
-  if (!r.ok) return { error: `upstream ${r.status}` };
+  if (!r.ok) return { error: `upstream ${r.status}`, status: r.status };
   const d = await r.json();
   const models = (d.data || []).map((m) => ({
     id: m.id,
@@ -603,9 +626,15 @@ export async function handleAdmin(request, env) {
 
   if (url.pathname === "/admin/api/models") {
     if (!keys.length) return json({ error: "pool empty" }, 500);
-    const d = await fetchModels(keys[0]);
-    if (d.error) return json(d, 502);
-    return json(d);
+    // 不再固定 keys[0]：按池序遍历，第一个成功即返回（避免某把 key 失效导致永远拉不到）
+    let last = null;
+    for (const k of rotate(keys)) {
+      const d = await fetchModels(k);
+      if (!d.error) return json(d);
+      last = d;
+      if (d.status !== 429 && d.status !== 401) break;
+    }
+    return json(last || { error: "no key available" }, 502);
   }
 
   if (url.pathname === "/admin/api/chat" && request.method === "POST") {

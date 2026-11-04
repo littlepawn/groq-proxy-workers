@@ -12,6 +12,9 @@
 const KV_POOL = "pool";
 const KV_TTL_MS = 30_000;
 
+// 覆盖层条目上限：人工增删量级远达不到，纯粹防异常循环把内存撑大
+const PENDING_MAX = 500;
+
 const enc = new TextEncoder();
 
 let cache = { at: 0, list: [] };
@@ -168,6 +171,7 @@ export async function addKeys(env, text) {
     existing.add(k);
     const rec = { id: await keyId(k), k, added: new Date().toISOString() };
     merged.push(rec);
+    if (pending.adds.size >= PENDING_MAX) pending.adds.delete(pending.adds.keys().next().value);
     pending.adds.set(rec.id, rec);
     added.push({ id: rec.id, key: mask(k) });
   }
@@ -192,6 +196,7 @@ export async function removeKey(env, id) {
   if (next.length === merged.length) return { removed: false };
   await env.KEYS_KV.put(KV_POOL, JSON.stringify(next));
   pending.adds.delete(id);
+  if (pending.dels.size >= PENDING_MAX) pending.dels.delete(pending.dels.values().next().value);
   pending.dels.add(id);
   cache = { at: Date.now(), list: norm(next) };
   return { removed: true };
