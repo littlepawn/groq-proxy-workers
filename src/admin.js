@@ -642,10 +642,12 @@ export async function handleAdmin(request, env) {
     const model = String(bodyIn.model || "openai/gpt-oss-20b");
     const prompt = String(bodyIn.prompt || "hi").slice(0, 2000);
     const t0 = Date.now();
+    // 走池：随机起点挑一把（不再固定 keys[0]），便于验证当前会被选中的 key 是否可用
+    const usedKey = rotate(keys)[0] || "";
     try {
       const r = await fetch(`${GROQ}/openai/v1/chat/completions`, {
         method: "POST",
-        headers: { authorization: `Bearer ${keys[0] || ""}`, "content-type": "application/json" },
+        headers: { authorization: `Bearer ${usedKey}`, "content-type": "application/json" },
         body: JSON.stringify({
           model,
           messages: [{ role: "user", content: prompt }],
@@ -653,6 +655,7 @@ export async function handleAdmin(request, env) {
           reasoning_effort: "low",
           stream: false,
         }),
+        signal: AbortSignal.timeout(90_000),
       });
       const ms = Date.now() - t0;
       const d = await r.json().catch(() => ({}));
@@ -663,7 +666,7 @@ export async function handleAdmin(request, env) {
       return json({
         ok: true,
         ms,
-        key: mask(keys[0]),
+        key: mask(usedKey),
         content: msg0.content || msg0.reasoning || JSON.stringify(d).slice(0, 500),
       });
     } catch (e) {
