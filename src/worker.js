@@ -144,6 +144,9 @@ export default {
 
     const target = new URL(request.url);
     target.hostname = GROQ_HOST;
+    // 兼容把 base_url 写成 https://<域名>/v1 的客户端（OpenAI 习惯）：
+    // Groq 的真实路径是 /openai/v1/*，不重写会直接 404 unknown_url。
+    if (target.pathname.startsWith("/v1/")) target.pathname = `/openai${target.pathname}`;
 
     const baseHeaders = new Headers(request.headers);
     baseHeaders.delete("host");
@@ -172,22 +175,29 @@ export default {
           headers,
           body,
           redirect: "follow",
-          signal: AbortSignal.timeout(120_000),
+          // 客户端断开就立刻中止上游，别再白烧额度；
+          // 超时放宽到 300s——SSE 长输出可能超过 2 分钟，120s 会把它截断。
+          signal: AbortSignal.any([request.signal, AbortSignal.timeout(300_000)]),
         });
       } catch (e) {
         lastResp = new Response(JSON.stringify({ error: { message: `upstream fetch failed: ${e.message}`, type: "upstream_error" } }), {
           status: 502,
           headers: { "content-type": "application/json" },
         });
+        // 大请求体是流，已经消费掉，换 key 重发没有意义
+        if (bigBody) break;
         continue;
       }
 
-      if (!bigBody && RETRY_STATUS.has(resp.status) && i < seq.length - 1) {
-        // 该 key 被限流或失效，换下一个。响应体丢弃前先取消，避免占用额度
+      if (RETRY_STATUS.has(resp.status)) {
+        // 该 key 被限流或失效：无论是不是最后一发都记进冷却，下次不再优先撞它
         coolKey(key, resp.status, resp.headers.get("retry-after"));
-        try { await resp.body?.cancel(); } catch (_) {}
-        lastResp = resp;
-        continue;
+        if (!bigBody && i < seq.length - 1) {
+          // 响应体丢弃前先取消，避免占用额度
+          try { await resp.body?.cancel(); } catch (_) {}
+          lastResp = resp;
+          continue;
+        }
       }
 
       if (resp.status === 200 && cooldown.has(key)) cooldown.delete(key);
