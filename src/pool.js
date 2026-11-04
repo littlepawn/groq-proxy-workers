@@ -46,7 +46,7 @@ async function readRaw(env) {
   if (!env.KEYS_KV) return [];
   try {
     const raw = await env.KEYS_KV.get(KV_POOL, "json");
-    return Array.isArray(raw) ? norm(raw) : [];
+    return Array.isArray(raw) ? await toRecords(raw) : [];
   } catch (_) {
     return [];
   }
@@ -72,6 +72,21 @@ export function staticKeys(env) {
   return norm((env.GROQ_KEYS || "").split(/[,\s]+/)).map((s) => ({ k: s, id: null, added: null }));
 }
 
+/**
+ * 把 KV 里的条目统一成记录形状 {id, k, added}。
+ * KV 里可能存的是纯字符串（早期版本、或用 wrangler kv key put 手工写），
+ * 不补 id 的话 pool() 取 x.k 会拿到 undefined，整条 key 被静默丢掉。
+ */
+async function toRecords(list) {
+  return Promise.all(
+    norm(list).map(async (item) =>
+      typeof item === "string"
+        ? { id: await keyId(item), k: item, added: null }
+        : { id: item.id || (await keyId(item.k)), k: item.k, added: item.added || null },
+    ),
+  );
+}
+
 /** KV 里的动态 key（管理台添加）。fresh=true 绕过 isolate 缓存直读 KV */
 export async function dynamicKeys(env, { fresh = false } = {}) {
   if (!env.KEYS_KV) return [];
@@ -80,7 +95,7 @@ export async function dynamicKeys(env, { fresh = false } = {}) {
   let list = [];
   try {
     const raw = await env.KEYS_KV.get(KV_POOL, "json");
-    list = Array.isArray(raw) ? norm(raw) : [];
+    list = Array.isArray(raw) ? await toRecords(raw) : [];
   } catch (_) {
     list = [];
   }
@@ -93,7 +108,14 @@ export async function dynamicKeys(env, { fresh = false } = {}) {
 export async function pool(env) {
   const s = staticKeys(env).map((x) => x.k);
   const d = (await dynamicKeys(env)).map((x) => x.k);
-  return norm([...s, ...d]).map((x) => (typeof x === "string" ? x : x.k));
+  const seen = new Set();
+  const out = [];
+  for (const k of [...s, ...d]) {
+    if (typeof k !== "string" || seen.has(k)) continue;
+    seen.add(k);
+    out.push(k);
+  }
+  return out;
 }
 
 /** 带元信息的号池视图（管理台用） */

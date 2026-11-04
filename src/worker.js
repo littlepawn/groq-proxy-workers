@@ -80,8 +80,25 @@ export default {
       return handleAdmin(request, env);
     }
 
-    // 简单探活 / 号池概览（不泄露 key）
+    // 极简健康位：无鉴权可探活，但不暴露任何号池信息
+    if (url.pathname === "/healthz") {
+      return cors(new Response(JSON.stringify({ ok: true }), {
+        headers: { "content-type": "application/json; charset=utf-8" },
+      }));
+    }
+
+    // 号池概览（mask 后的 key 尾 4 位）：属于运维信息，收进鉴权。
+    // 设了 PROXY_TOKEN 就跟 API 一样要带 Bearer；未设令牌的部署保持公开。
     if (url.pathname === "/" || url.pathname === "/__pool") {
+      if (env.PROXY_TOKEN) {
+        const got = (request.headers.get("authorization") || "").replace(/^Bearer\s+/i, "").trim();
+        if (!safeEqual(got, env.PROXY_TOKEN)) {
+          return cors(new Response(JSON.stringify({ error: { message: "invalid proxy token", type: "unauthorized" } }), {
+            status: 401,
+            headers: { "content-type": "application/json" },
+          }));
+        }
+      }
       const keys = await pool(env);
       return cors(
         new Response(

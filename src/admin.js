@@ -116,6 +116,8 @@ async function probeOne(k, i) {
         max_tokens: 1,
         stream: false,
       }),
+      // 单把 key 卡住不能拖垮整页探活
+      signal: AbortSignal.timeout(30_000),
     });
     rec.status = r.status;
     rec.ms = Date.now() - t0;
