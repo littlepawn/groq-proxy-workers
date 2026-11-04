@@ -568,7 +568,8 @@ export async function handleAdmin(request, env) {
 
   const authed = await isAuthed(request, env);
 
-  if (url.pathname === "/admin" || url.pathname === "/admin/") {
+  if (url.pathname === "/admin" || url.pathname === "/admin/" || url.pathname === "/admin/login") {
+    // 未登录访问 /admin/login 也回登录页（GET 直敲地址不该 401）；已登录同样进管理台
     if (!authed) return new Response(loginPage(""), {
       headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" },
     });
